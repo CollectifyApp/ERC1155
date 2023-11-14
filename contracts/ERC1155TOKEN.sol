@@ -14,6 +14,14 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
     string public name;
     string public symbol;
     string public baseURI = "";
+    address public tokenContract;
+    Fee[] private fees;
+
+    struct Fee {
+        address destination;
+        uint256 payableercent;
+    }
+
     mapping(uint256 => string) private _tokenURIs;
 
     mapping (uint256 => bool) public avaliable_ids;
@@ -44,7 +52,6 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
         TimeZone timezone;
         mapping(address => bool) privateClaimList;
         mapping(address => bool) publicClaimList;
-        address tokenContract;
     }
 
     address[] private _operatorFilterAddresses;
@@ -80,11 +87,17 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
         string memory _name,
         string memory _symbol,
         string memory _uri,
-        uint96 royaltyFraction
+        uint96 royaltyFraction,
+        Fee[] memory _fees,
+        address _tokenContract
     ) ERC1155(_uri) {
         name = _name;
         symbol = _symbol;
         baseURI = _uri;
+        tokenContract = _tokenContract;
+        for (uint256 i = 0; i < _fees.length; i++) {
+            fees.push(_fees[i]);
+        }
         _setDefaultRoyalty(_msgSender(), royaltyFraction);
     }
 
@@ -109,6 +122,17 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
                 mintInfoList[id].publicClaimList[owner]
             )
         );
+    }
+
+    function feeInfo() public view returns (Fee[] memory) {
+        uint256 ownerFee = 10000;
+        Fee[] memory _fees = new Fee[](fees.length + 1);
+        for (uint256 i = 0; i < fees.length; i++) {
+            ownerFee = ownerFee - fees[i].payableercent;
+            _fees[i] = fees[i];
+        }
+        _fees[fees.length] = Fee(owner(), ownerFee);
+        return _fees;
     }
 
     function changeBaseURI(string memory _uri) public onlyOwner {
@@ -140,7 +164,7 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
         mintInfoList[id].publicMintTime = _publicMintTime;
     }
 
-    function createNewid(uint256 id, bytes32 _merkleRoot, uint256 _maxSupply, uint256 _mintPrice, uint256 _maxPerAddress, TimeZone memory _timezone, MintTime memory _publicMintTime, MintTime memory _privateMintTime,  address _tokenContract) public onlyOwner {
+    function createNewid(uint256 id, bytes32 _merkleRoot, uint256 _maxSupply, uint256 _mintPrice, uint256 _maxPerAddress, TimeZone memory _timezone, MintTime memory _publicMintTime, MintTime memory _privateMintTime) public onlyOwner {
         require(!avaliable_ids[id], "Not avaliable");
         avaliable_ids[id] = true;
         mintInfoList[id].merkleRoot = _merkleRoot;
@@ -150,7 +174,6 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
         mintInfoList[id].timezone = _timezone;
         mintInfoList[id].publicMintTime = _publicMintTime;
         mintInfoList[id].privateMintTime = _privateMintTime;
-        mintInfoList[id].tokenContract = _tokenContract;
     }
 
     function privateMint(uint256 id, uint256 quantity, uint256 whiteQuantity, bytes32[] calldata merkleProof) external payable validId(id) {
@@ -166,10 +189,10 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
             MerkleProof.verify(merkleProof, mintInfoList[id].merkleRoot, keccak256(abi.encodePacked(claimAddress, whiteQuantity))),
             "error:10004 not in the whitelist"
         );
-        if (mintInfoList[id].tokenContract == address(0)) {
+        if (tokenContract == address(0)) {
             require(mintInfoList[id].mintPrice * quantity <= msg.value, "error: 10002 price insufficient");
         } else {
-            (bool success, bytes memory data) = mintInfoList[id].tokenContract.call(abi.encodeWithSelector(0x23b872dd, claimAddress, address(this), mintInfoList[_id].mintPrice * quantity));
+            (bool success, bytes memory data) = tokenContract.call(abi.encodeWithSelector(0x23b872dd, claimAddress, address(this), mintInfoList[_id].mintPrice * quantity));
             require(
                 success && (data.length == 0 || abi.decode(data, (bool))),
                 "error: 10002 price insufficient"
@@ -187,10 +210,10 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
         address claimAddress = _msgSender();
         require(!mintInfoList[id].publicClaimList[claimAddress], "error:10003 already claimed");
         require(quantity <= mintInfoList[id].maxCountPerAddress, "10004 max per address exceeded");
-        if (mintInfoList[id].tokenContract == address(0)) {
+        if (tokenContract == address(0)) {
             require(mintInfoList[id].mintPrice * quantity <= msg.value, "error: 10002 price insufficient");
         } else {
-            (bool success, bytes memory data) = mintInfoList[id].tokenContract.call(abi.encodeWithSelector(0x23b872dd, claimAddress, address(this), mintInfoList[id].mintPrice * quantity));
+            (bool success, bytes memory data) = tokenContract.call(abi.encodeWithSelector(0x23b872dd, claimAddress, address(this), mintInfoList[id].mintPrice * quantity));
             require(
                 success && (data.length == 0 || abi.decode(data, (bool))),
                 "error: 10002 price insufficient"
@@ -247,17 +270,25 @@ contract ERC1155TOKEN is ERC2981, ERC1155, ERC1155Supply, Ownable {
 
 
     // This allows the contract owner to withdraw the funds from the contract.
-    function withdraw(uint256 id, uint amt) external onlyOwner validId(id) {
-        if (mintInfoList[id].tokenContract == address(0)) {
-            (bool sent, ) = payable(_msgSender()).call{value: amt}("");
-            require(sent, "GG: Failed to withdraw Ether");
+    function withdraw(uint amt) external onlyOwner {
+        Fee[] memory feeInfos = feeInfo();
+        if (tokenContract == address(0)) {
+            require(amt <= address(this).balance, "GG: Insufficient balance");
+            for(uint256 i = 0; i < feeInfos.length; i++) {
+                (bool sent, ) = payable(feeInfos[i].destination).call{value: amt * feeInfos[i].payableercent / 10000}("");
+                require(sent, "GG: Failed to withdraw Ether");
+            }
         } else {
-            (bool success, bytes memory data) = mintInfoList[id].tokenContract.call(abi.encodeWithSelector(0xa9059cbb, _msgSender(), amt));
-            require(
-                success && (data.length == 0 || abi.decode(data, (bool))),
-                "GG: Failed to withdraw Ether"
-            );
+            (, bytes memory balance) = tokenContract.call(abi.encodeWithSelector(0x70a08231, address(this)));
+            
+            require(amt <= abi.decode(balance, (uint256)), "GG: Insufficient balance");
+            for(uint256 i = 0; i < feeInfos.length; i++) {
+                (bool success, bytes memory data) = tokenContract.call(abi.encodeWithSelector(0xa9059cbb, feeInfos[i].destination, amt * fees[i].payableercent / 10000));
+                require(
+                    success && (data.length == 0 || abi.decode(data, (bool))),
+                    "GG: Failed to withdraw Ether"
+                );
+            }
         }
-
     }
 }
